@@ -181,6 +181,14 @@ class PosthogFlutterIO extends PosthogFlutterPlatformInterface {
     // Store config for later use in exception processing
     _config = config;
 
+    // Wire up the user-supplied context provider so SurveyService can show
+    // surveys without PosthogObserver being registered in navigatorObservers.
+    // Only applied when the caller explicitly set surveyContextProvider;
+    // otherwise SurveyService continues to use PosthogObserver (existing path).
+    if (config.surveyContextProvider != null) {
+      SurveyService().setContextProvider(config.surveyContextProvider!);
+    }
+
     if (!isSupportedPlatform()) {
       return;
     }

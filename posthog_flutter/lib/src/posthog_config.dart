@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/widgets.dart';
+
 import 'posthog_event.dart';
 import 'posthog_flutter_platform_interface.dart';
 
@@ -145,7 +147,8 @@ class PostHogConfig {
   /// **Notes:**
   /// - After calling `Posthog().close()`, surveys will not be rendered until the
   ///   SDK is re-initialized and the next navigation event occurs.
-  /// - You must install `PosthogObserver` in your app for surveys to display.
+  /// - You must install `PosthogObserver` in your app for surveys to display,
+  ///   **or** supply a [surveyContextProvider] as an alternative.
   ///   - See: https://posthog.com/docs/surveys/installation?tab=Flutter#step-two-install-posthogobserver
   /// - For Flutter web, this setting will be ignored. Surveys on web use the
   ///   JavaScript Web SDK instead.
@@ -153,6 +156,33 @@ class PostHogConfig {
   ///
   /// Defaults to true.
   var surveys = true;
+
+  /// Optional callback providing the [BuildContext] used to display surveys.
+  ///
+  /// When set, this takes precedence over [PosthogObserver]'s stored context,
+  /// making [PosthogObserver] optional for apps that only need surveys and not
+  /// automatic screen tracking (or that manage navigation differently, e.g.
+  /// go_router, a custom navigator, etc.).
+  ///
+  /// The callback may return `null` during app initialization — for example
+  /// while a splash screen or auth gate is showing and the main navigator is
+  /// not yet mounted. The SDK automatically retries every 500 ms for up to
+  /// 30 s, so surveys triggered during boot are queued and not silently lost.
+  ///
+  /// A common pattern is to use a [GlobalKey<NavigatorState>]:
+  /// ```dart
+  /// final navigatorKey = GlobalKey<NavigatorState>();
+  ///
+  /// final config = PostHogConfig('phc_...');
+  /// config.surveyContextProvider = () => navigatorKey.currentContext;
+  ///
+  /// MaterialApp(navigatorKey: navigatorKey, ...)
+  /// ```
+  ///
+  /// If `null`, surveys fall back to using [PosthogObserver]'s stored context
+  /// (the existing behaviour — no change required for apps already using
+  /// [PosthogObserver]).
+  BuildContext? Function()? surveyContextProvider;
 
   /// Configuration for error tracking and exception capture.
   final errorTrackingConfig = PostHogErrorTrackingConfig();
