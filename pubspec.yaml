@@ -1,4 +1,4 @@
-name: flutter_posthog
+name: posthog_flutter
 publish_to: none
 
 environment:
