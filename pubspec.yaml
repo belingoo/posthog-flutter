@@ -1,8 +1,8 @@
-name: _
+name: flutter_posthog
 publish_to: none
 
 environment:
-  sdk: '>=3.6.0 <4.0.0'
+  sdk: ">=3.6.0 <4.0.0"
 
 workspace:
   - posthog_flutter
