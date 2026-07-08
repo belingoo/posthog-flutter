@@ -1,13 +1,24 @@
 package com.posthog.flutter
 
+import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Rect
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.PixelCopy
+import android.view.SurfaceView
+import android.view.View
+import android.view.ViewGroup
+import androidx.annotation.RequiresApi
 import com.posthog.PersonProfiles
 import com.posthog.PostHog
 import com.posthog.PostHogConfig
@@ -15,16 +26,25 @@ import com.posthog.PostHogOnFeatureFlags
 import com.posthog.android.PostHogAndroid
 import com.posthog.android.PostHogAndroidConfig
 import com.posthog.android.internal.getApplicationInfo
+import com.posthog.logs.PostHogLogSeverity
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import java.util.Date
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import kotlin.math.roundToInt
+
+private const val FLUTTER_VIEW_CLASS_PREFIX = "io.flutter"
 
 /** PosthogFlutterPlugin */
 class PosthogFlutterPlugin :
     FlutterPlugin,
+    ActivityAware,
     MethodCallHandler {
     // / The MethodChannel that will be the communication between Flutter and native Android
     // /
@@ -33,7 +53,10 @@ class PosthogFlutterPlugin :
     private lateinit var channel: MethodChannel
 
     private lateinit var applicationContext: Context
+    private var activity: Activity? = null
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val bitmapExportExecutor = Executors.newSingleThreadExecutor()
     private val snapshotSender = SnapshotSender()
 
     // The surveys delegate
@@ -60,14 +83,15 @@ class PosthogFlutterPlugin :
             }
 
             val projectToken =
-                (bundle.getString("com.posthog.posthog.PROJECT_TOKEN")
-                    ?: bundle.getString("com.posthog.posthog.API_KEY"))
-                    ?.trim()
+                (
+                    bundle.getString("com.posthog.posthog.PROJECT_TOKEN")
+                        ?: bundle.getString("com.posthog.posthog.API_KEY")
+                )?.trim()
 
             if (!bundle.containsKey("com.posthog.posthog.PROJECT_TOKEN") && bundle.containsKey("com.posthog.posthog.API_KEY")) {
                 Log.w(
                     "PostHog",
-                    "com.posthog.posthog.API_KEY is deprecated and will be removed in the next major version. Use com.posthog.posthog.PROJECT_TOKEN instead!"
+                    "com.posthog.posthog.API_KEY is deprecated and will be removed in the next major version. Use com.posthog.posthog.PROJECT_TOKEN instead!",
                 )
             }
 
@@ -76,16 +100,19 @@ class PosthogFlutterPlugin :
                 return
             }
 
-            val host = bundle.getString("com.posthog.posthog.POSTHOG_HOST", PostHogConfig.DEFAULT_HOST)
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-                ?: PostHogConfig.DEFAULT_HOST
+            val host =
+                bundle
+                    .getString("com.posthog.posthog.POSTHOG_HOST", PostHogConfig.DEFAULT_HOST)
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: PostHogConfig.DEFAULT_HOST
             // Check new key first, then legacy key, default to true
-            val captureApplicationLifecycleEvents = if (bundle.containsKey("com.posthog.posthog.CAPTURE_APPLICATION_LIFECYCLE_EVENTS")) {
-                bundle.getBoolean("com.posthog.posthog.CAPTURE_APPLICATION_LIFECYCLE_EVENTS", true)
-            } else {
-                bundle.getBoolean("com.posthog.posthog.TRACK_APPLICATION_LIFECYCLE_EVENTS", true)
-            }
+            val captureApplicationLifecycleEvents =
+                if (bundle.containsKey("com.posthog.posthog.CAPTURE_APPLICATION_LIFECYCLE_EVENTS")) {
+                    bundle.getBoolean("com.posthog.posthog.CAPTURE_APPLICATION_LIFECYCLE_EVENTS", true)
+                } else {
+                    bundle.getBoolean("com.posthog.posthog.TRACK_APPLICATION_LIFECYCLE_EVENTS", true)
+                }
             val debug = bundle.getBoolean("com.posthog.posthog.DEBUG", false)
 
             val posthogConfig = mutableMapOf<String, Any>()
@@ -126,6 +153,10 @@ class PosthogFlutterPlugin :
                 screen(call, result)
             }
 
+            "captureLog" -> {
+                captureLog(call, result)
+            }
+
             "alias" -> {
                 alias(call, result)
             }
@@ -156,6 +187,22 @@ class PosthogFlutterPlugin :
 
             "reloadFeatureFlags" -> {
                 reloadFeatureFlags(result)
+            }
+
+            "setPersonPropertiesForFlags" -> {
+                setPersonPropertiesForFlags(call, result)
+            }
+
+            "resetPersonPropertiesForFlags" -> {
+                resetPersonPropertiesForFlags(result)
+            }
+
+            "setGroupPropertiesForFlags" -> {
+                setGroupPropertiesForFlags(call, result)
+            }
+
+            "resetGroupPropertiesForFlags" -> {
+                resetGroupPropertiesForFlags(call, result)
             }
 
             "group" -> {
@@ -194,6 +241,10 @@ class PosthogFlutterPlugin :
                 captureException(call, result)
             }
 
+            "addExceptionStep" -> {
+                addExceptionStep(call, result)
+            }
+
             "close" -> {
                 close(result)
             }
@@ -204,6 +255,14 @@ class PosthogFlutterPlugin :
 
             "sendFullSnapshot" -> {
                 handleSendFullSnapshot(call, result)
+            }
+
+            "captureNativeScreenshot" -> {
+                handleCaptureNativeScreenshot(call, result)
+            }
+
+            "captureNativeScreenshots" -> {
+                handleCaptureNativeScreenshots(call, result)
             }
 
             "isSessionReplayActive" -> {
@@ -294,13 +353,14 @@ class PosthogFlutterPlugin :
 
     private fun setupPostHog(posthogConfig: Map<String, Any>) {
         val projectToken =
-            ((posthogConfig["projectToken"] as String?)
-                ?: (posthogConfig["apiKey"] as String?))
-                ?.trim()
+            (
+                (posthogConfig["projectToken"] as String?)
+                    ?: (posthogConfig["apiKey"] as String?)
+            )?.trim()
         if (!posthogConfig.containsKey("projectToken") && posthogConfig.containsKey("apiKey")) {
             Log.w(
                 "PostHog",
-                "apiKey is deprecated and will be removed in the next major version. Use projectToken instead!"
+                "apiKey is deprecated and will be removed in the next major version. Use projectToken instead!",
             )
         }
         if (projectToken.isNullOrEmpty()) {
@@ -383,6 +443,49 @@ class PosthogFlutterPlugin :
                     errorConfig.getIfNotNull<List<String>>("inAppIncludes") { includes ->
                         errorTrackingConfig.inAppIncludes.addAll(includes)
                     }
+                    errorConfig.getIfNotNull<Map<String, Any>>("exceptionSteps") { stepsConfig ->
+                        stepsConfig.getIfNotNull<Boolean>("enabled") {
+                            errorTrackingConfig.exceptionSteps.enabled = it
+                        }
+                        stepsConfig.getIfNotNull<Int>("maxBytes") {
+                            errorTrackingConfig.exceptionSteps.maxBytes = it
+                        }
+                    }
+                }
+
+                // Configure logs (beforeSend runs Dart-side). Each field is only
+                // present when the user set it; unset fields keep native defaults.
+                posthogConfig.getIfNotNull<Map<String, Any>>("logs") { logsConfig ->
+                    logsConfig.getIfNotNull<String>("serviceName") {
+                        logs.serviceName = it
+                    }
+                    logsConfig.getIfNotNull<String>("serviceVersion") {
+                        logs.serviceVersion = it
+                    }
+                    logsConfig.getIfNotNull<String>("environment") {
+                        logs.environment = it
+                    }
+                    logsConfig.getIfNotNull<Map<String, Any>>("resourceAttributes") {
+                        logs.resourceAttributes = it
+                    }
+                    logsConfig.getIfNotNull<Int>("flushIntervalSeconds") {
+                        logs.flushIntervalSeconds = it
+                    }
+                    logsConfig.getIfNotNull<Int>("flushAt") {
+                        logs.flushAt = it
+                    }
+                    logsConfig.getIfNotNull<Int>("maxBatchSize") {
+                        logs.maxBatchSize = it
+                    }
+                    logsConfig.getIfNotNull<Int>("maxBufferSize") {
+                        logs.maxBufferSize = it
+                    }
+                    logsConfig.getIfNotNull<Int>("rateCapMaxLogs") {
+                        logs.rateCapMaxLogs = it
+                    }
+                    logsConfig.getIfNotNull<Int>("rateCapWindowSeconds") {
+                        logs.rateCapWindowSeconds = it
+                    }
                 }
 
                 sdkName = "posthog-flutter"
@@ -398,8 +501,25 @@ class PosthogFlutterPlugin :
         PostHogAndroid.setup(applicationContext, config)
     }
 
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        activity = binding.activity
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activity = null
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        activity = binding.activity
+    }
+
+    override fun onDetachedFromActivity() {
+        activity = null
+    }
+
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
+        bitmapExportExecutor.shutdown()
     }
 
     private fun handleSendFullSnapshot(
@@ -419,6 +539,386 @@ class PosthogFlutterPlugin :
             }
         } catch (e: Throwable) {
             result.error("PosthogFlutterException", e.localizedMessage, null)
+        }
+    }
+
+    private fun handleCaptureNativeScreenshot(
+        call: MethodCall,
+        result: Result,
+    ) {
+        try {
+            val currentActivity =
+                activity ?: run {
+                    result.success(null)
+                    return
+                }
+            val x = call.argument<Int>("x") ?: 0
+            val y = call.argument<Int>("y") ?: 0
+            val width = call.argument<Int>("width") ?: 0
+            val height = call.argument<Int>("height") ?: 0
+            if (width <= 0 || height <= 0) {
+                result.error("INVALID_ARGUMENT", "Width or height is 0", null)
+                return
+            }
+            captureOneNative(currentActivity, x, y, width, height) { bytes ->
+                result.success(bytes)
+            }
+        } catch (e: Throwable) {
+            result.error("PosthogFlutterException", e.localizedMessage, null)
+        }
+    }
+
+    private fun handleCaptureNativeScreenshots(
+        call: MethodCall,
+        result: Result,
+    ) {
+        try {
+            val currentActivity =
+                activity ?: run {
+                    result.success(emptyList<ByteArray?>())
+                    return
+                }
+
+            @Suppress("UNCHECKED_CAST")
+            val views = call.argument<List<Map<String, Int>>>("views") ?: emptyList()
+            if (views.isEmpty()) {
+                result.success(emptyList<ByteArray?>())
+                return
+            }
+            val results = ArrayList<ByteArray?>(views.size)
+
+            fun captureNext(index: Int) {
+                if (index >= views.size) {
+                    result.success(results)
+                    return
+                }
+                val v = views[index]
+                val x = v["x"] ?: 0
+                val y = v["y"] ?: 0
+                val w = v["width"] ?: 0
+                val h = v["height"] ?: 0
+                if (w <= 0 || h <= 0) {
+                    results.add(null)
+                    captureNext(index + 1)
+                    return
+                }
+                captureOneNative(currentActivity, x, y, w, h) { bytes ->
+                    results.add(bytes)
+                    captureNext(index + 1)
+                }
+            }
+            captureNext(0)
+        } catch (e: Throwable) {
+            result.error("PosthogFlutterException", e.localizedMessage, null)
+        }
+    }
+
+    private fun captureOneNative(
+        activity: Activity,
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        onResult: (ByteArray?) -> Unit,
+    ) {
+        val contentView =
+            activity.findViewById<View>(android.R.id.content) ?: run {
+                onResult(null)
+                return
+            }
+
+        val contentWidthPx = contentView.width
+        val contentHeightPx = contentView.height
+        if (contentWidthPx <= 0 || contentHeightPx <= 0) {
+            onResult(null)
+            return
+        }
+
+        val density = activity.resources.displayMetrics.density
+        val cropLeft = (x * density).roundToInt().coerceIn(0, contentWidthPx - 1)
+        val cropTop = (y * density).roundToInt().coerceIn(0, contentHeightPx - 1)
+        val cropRight = ((x + width) * density).roundToInt().coerceIn(cropLeft + 1, contentWidthPx)
+        val cropBottom = ((y + height) * density).roundToInt().coerceIn(cropTop + 1, contentHeightPx)
+
+        val logicalWidth = width.coerceAtLeast(1)
+        val logicalHeight = height.coerceAtLeast(1)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val locationInWindow = IntArray(2)
+            contentView.getLocationInWindow(locationInWindow)
+
+            val bitmap = Bitmap.createBitmap(logicalWidth, logicalHeight, Bitmap.Config.ARGB_8888)
+
+            // Flutter renders on FlutterSurfaceView — a SurfaceView that lives OUTSIDE the
+            // window surface in its own hardware-composited layer. Capturing activity.window
+            // gives only the (empty) window background. We must capture FlutterSurfaceView
+            // directly, then composite any platform-view SurfaceViews (e.g. google_maps_flutter)
+            // on top.
+            val allSurfaceViews = collectAllSurfaceViews(contentView)
+
+            val flutterSv = allSurfaceViews.firstOrNull { it.javaClass.name.startsWith(FLUTTER_VIEW_CLASS_PREFIX) }
+            val platformViewSvs = allSurfaceViews.filter { !it.javaClass.name.startsWith(FLUTTER_VIEW_CLASS_PREFIX) }
+
+            if (flutterSv == null) {
+                val srcRect =
+                    Rect(
+                        locationInWindow[0] + cropLeft,
+                        locationInWindow[1] + cropTop,
+                        locationInWindow[0] + cropRight,
+                        locationInWindow[1] + cropBottom,
+                    )
+                PixelCopy.request(
+                    activity.window,
+                    srcRect,
+                    bitmap,
+                    { copyResult ->
+                        if (copyResult != PixelCopy.SUCCESS) {
+                            bitmap.recycle()
+                            captureNativeScreenshotFallback(
+                                contentView,
+                                cropLeft,
+                                cropTop,
+                                cropRight,
+                                cropBottom,
+                                logicalWidth,
+                                logicalHeight,
+                                onResult,
+                            )
+                            return@request
+                        }
+                        exportBitmapAsync(bitmap, onResult)
+                    },
+                    mainHandler,
+                )
+                return
+            }
+
+            if (flutterSv.width <= 0 || flutterSv.height <= 0) {
+                bitmap.recycle()
+                onResult(null)
+                return
+            }
+            val fsvLocation = IntArray(2)
+            flutterSv.getLocationInWindow(fsvLocation)
+            val fsvSrcLeft = (locationInWindow[0] + cropLeft - fsvLocation[0]).coerceIn(0, flutterSv.width - 1)
+            val fsvSrcTop = (locationInWindow[1] + cropTop - fsvLocation[1]).coerceIn(0, flutterSv.height - 1)
+            val fsvSrcRight = (locationInWindow[0] + cropRight - fsvLocation[0]).coerceIn(fsvSrcLeft + 1, flutterSv.width)
+            val fsvSrcBottom = (locationInWindow[1] + cropBottom - fsvLocation[1]).coerceIn(fsvSrcTop + 1, flutterSv.height)
+            val fsvSrcRect = Rect(fsvSrcLeft, fsvSrcTop, fsvSrcRight, fsvSrcBottom)
+
+            PixelCopy.request(
+                flutterSv,
+                fsvSrcRect,
+                bitmap,
+                { copyResult ->
+                    if (copyResult != PixelCopy.SUCCESS) {
+                        bitmap.recycle()
+                        captureNativeScreenshotFallback(
+                            contentView,
+                            cropLeft,
+                            cropTop,
+                            cropRight,
+                            cropBottom,
+                            logicalWidth,
+                            logicalHeight,
+                            onResult,
+                        )
+                        return@request
+                    }
+
+                    if (platformViewSvs.isEmpty()) {
+                        exportBitmapAsync(bitmap, onResult)
+                    } else {
+                        compositeSurfaceViewsOnto(
+                            svList = platformViewSvs,
+                            destBitmap = bitmap,
+                            contentViewLocation = locationInWindow,
+                            cropLeft = cropLeft,
+                            cropTop = cropTop,
+                            density = density,
+                            index = 0,
+                        ) {
+                            exportBitmapAsync(bitmap, onResult)
+                        }
+                    }
+                },
+                mainHandler,
+            )
+            return
+        }
+
+        captureNativeScreenshotFallback(
+            contentView = contentView,
+            cropLeft = cropLeft,
+            cropTop = cropTop,
+            cropRight = cropRight,
+            cropBottom = cropBottom,
+            logicalWidth = logicalWidth,
+            logicalHeight = logicalHeight,
+            onResult = onResult,
+        )
+    }
+
+    private fun collectAllSurfaceViews(view: View): List<SurfaceView> {
+        val result = mutableListOf<SurfaceView>()
+        if (view is SurfaceView) {
+            result.add(view)
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                result.addAll(collectAllSurfaceViews(view.getChildAt(i)))
+            }
+        }
+        return result
+    }
+
+    @Suppress("SameParameterValue")
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun compositeSurfaceViewsOnto(
+        svList: List<SurfaceView>,
+        destBitmap: Bitmap,
+        contentViewLocation: IntArray,
+        cropLeft: Int,
+        cropTop: Int,
+        density: Float,
+        index: Int,
+        onComplete: () -> Unit,
+    ) {
+        if (index >= svList.size) {
+            onComplete()
+            return
+        }
+        val sv = svList[index]
+        val advance = {
+            compositeSurfaceViewsOnto(svList, destBitmap, contentViewLocation, cropLeft, cropTop, density, index + 1, onComplete)
+        }
+
+        if (!sv.isAttachedToWindow || sv.width <= 0 || sv.height <= 0) {
+            advance()
+            return
+        }
+
+        val svLocation = IntArray(2)
+        sv.getLocationInWindow(svLocation)
+
+        val destX = ((svLocation[0] - contentViewLocation[0] - cropLeft) / density).roundToInt()
+        val destY = ((svLocation[1] - contentViewLocation[1] - cropTop) / density).roundToInt()
+        val svLogW = (sv.width / density).roundToInt().coerceAtLeast(1)
+        val svLogH = (sv.height / density).roundToInt().coerceAtLeast(1)
+
+        // Skip a SurfaceView extending well beyond the captured region: it's a
+        // different platform view (e.g. a masked map) that merely overlaps, so
+        // compositing it would leak masked content. Slack absorbs rounding.
+        val tolerance = 8
+        if (destX < -tolerance || destY < -tolerance ||
+            destX + svLogW > destBitmap.width + tolerance ||
+            destY + svLogH > destBitmap.height + tolerance
+        ) {
+            advance()
+            return
+        }
+
+        val svBitmap = Bitmap.createBitmap(svLogW, svLogH, Bitmap.Config.ARGB_8888)
+        try {
+            PixelCopy.request(
+                sv,
+                null,
+                svBitmap,
+                { svCopyResult ->
+                    if (svCopyResult == PixelCopy.SUCCESS) {
+                        val canvas = android.graphics.Canvas(destBitmap)
+                        val paint =
+                            android.graphics.Paint().apply {
+                                // SRC replaces the destination, including any background fill in the
+                                // "hole" left by the SurfaceView in the window surface.
+                                xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC)
+                            }
+                        canvas.drawBitmap(svBitmap, destX.toFloat(), destY.toFloat(), paint)
+                    }
+                    svBitmap.recycle()
+                    advance()
+                },
+                mainHandler,
+            )
+        } catch (e: Throwable) {
+            svBitmap.recycle()
+            advance()
+        }
+    }
+
+    private fun captureNativeScreenshotFallback(
+        contentView: View,
+        cropLeft: Int,
+        cropTop: Int,
+        cropRight: Int,
+        cropBottom: Int,
+        logicalWidth: Int,
+        logicalHeight: Int,
+        onResult: (ByteArray?) -> Unit,
+    ) {
+        val contentBitmap =
+            Bitmap.createBitmap(contentView.width, contentView.height, Bitmap.Config.ARGB_8888)
+        // Software Canvas cannot read GPU-composited surfaces like SurfaceView or TextureView,
+        // so those platform views may still appear blank when we hit this fallback path.
+        contentView.draw(android.graphics.Canvas(contentBitmap))
+
+        val croppedBitmap =
+            Bitmap.createBitmap(
+                contentBitmap,
+                cropLeft,
+                cropTop,
+                cropRight - cropLeft,
+                cropBottom - cropTop,
+            )
+        contentBitmap.recycle()
+
+        val outputBitmap =
+            if (croppedBitmap.width == logicalWidth && croppedBitmap.height == logicalHeight) {
+                croppedBitmap
+            } else {
+                Bitmap.createScaledBitmap(croppedBitmap, logicalWidth, logicalHeight, true).also {
+                    croppedBitmap.recycle()
+                }
+            }
+
+        exportBitmapAsync(outputBitmap, onResult)
+    }
+
+    private fun bitmapToRawRgba(bitmap: Bitmap): ByteArray {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        bitmap.recycle()
+        val bytes = ByteArray(pixels.size * 4)
+        for (i in pixels.indices) {
+            val pixel = pixels[i]
+            bytes[i * 4] = ((pixel shr 16) and 0xFF).toByte() // R
+            bytes[i * 4 + 1] = ((pixel shr 8) and 0xFF).toByte() // G
+            bytes[i * 4 + 2] = (pixel and 0xFF).toByte() // B
+            bytes[i * 4 + 3] = ((pixel shr 24) and 0xFF).toByte() // A
+        }
+        return bytes
+    }
+
+    private fun exportBitmapAsync(
+        bitmap: Bitmap,
+        onResult: (ByteArray?) -> Unit,
+    ) {
+        // A PixelCopy callback can fire after onDetachedFromEngine shut the
+        // executor down. Guard the submission so it neither crashes the main
+        // thread (RejectedExecutionException) nor leaks the bitmap.
+        try {
+            bitmapExportExecutor.execute {
+                try {
+                    val rgbaBytes = bitmapToRawRgba(bitmap)
+                    mainHandler.post { onResult(rgbaBytes) }
+                } catch (e: Throwable) {
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    mainHandler.post { onResult(null) }
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            if (!bitmap.isRecycled) bitmap.recycle()
+            mainHandler.post { onResult(null) }
         }
     }
 
@@ -542,6 +1042,34 @@ class PosthogFlutterPlugin :
         }
     }
 
+    private fun captureLog(
+        call: MethodCall,
+        result: Result,
+    ) {
+        val body: String? = call.argument("body")
+        if (body == null) {
+            result.error("PosthogFlutterException", "Missing argument: body", null)
+            return
+        }
+        try {
+            val level: String = call.argument("level") ?: "info"
+            val attributes: Map<String, Any>? = call.argument("attributes")
+            val traceId: String? = call.argument("traceId")
+            val spanId: String? = call.argument("spanId")
+            // traceFlags 0 is meaningful (W3C sampled-false); null omits it.
+            val traceFlags: Int? = call.argument("traceFlags")
+            // Unknown levels fall back to INFO.
+            val severity = PostHogLogSeverity.from(level) ?: PostHogLogSeverity.INFO
+            PostHog.captureLog(body, severity, attributes, traceId, spanId, traceFlags)
+            result.success(null)
+        } catch (e: Throwable) {
+            // Unlike the other handlers, avoid returning e.localizedMessage: a
+            // captureLog failure can carry the log body or attribute values, and
+            // the message is forwarded back over the channel.
+            result.error("PosthogFlutterException", "Failed to capture log", null)
+        }
+    }
+
     private fun alias(
         call: MethodCall,
         result: Result,
@@ -628,7 +1156,64 @@ class PosthogFlutterPlugin :
 
     private fun reloadFeatureFlags(result: Result) {
         try {
-            PostHog.reloadFeatureFlags()
+            // Resolve the Dart Future only once flags have actually finished
+            // loading. The native callback fires on a background thread, so the
+            // result must be posted back to the main thread for Flutter.
+            PostHog.reloadFeatureFlags {
+                Handler(Looper.getMainLooper()).post {
+                    result.success(null)
+                }
+            }
+        } catch (e: Throwable) {
+            result.error("PosthogFlutterException", e.localizedMessage, null)
+        }
+    }
+
+    // reloadFeatureFlags is handled on the Dart side (so the Future resolves only
+    // after the awaited reload completes), so we always disable the native reload.
+    private fun setPersonPropertiesForFlags(
+        call: MethodCall,
+        result: Result,
+    ) {
+        try {
+            val userProperties: Map<String, Any> = call.argument("userProperties")!!
+            PostHog.setPersonPropertiesForFlags(userProperties, reloadFeatureFlags = false)
+            result.success(null)
+        } catch (e: Throwable) {
+            result.error("PosthogFlutterException", e.localizedMessage, null)
+        }
+    }
+
+    private fun resetPersonPropertiesForFlags(result: Result) {
+        try {
+            PostHog.resetPersonPropertiesForFlags(reloadFeatureFlags = false)
+            result.success(null)
+        } catch (e: Throwable) {
+            result.error("PosthogFlutterException", e.localizedMessage, null)
+        }
+    }
+
+    private fun setGroupPropertiesForFlags(
+        call: MethodCall,
+        result: Result,
+    ) {
+        try {
+            val groupType: String = call.argument("groupType")!!
+            val groupProperties: Map<String, Any> = call.argument("groupProperties")!!
+            PostHog.setGroupPropertiesForFlags(groupType, groupProperties, reloadFeatureFlags = false)
+            result.success(null)
+        } catch (e: Throwable) {
+            result.error("PosthogFlutterException", e.localizedMessage, null)
+        }
+    }
+
+    private fun resetGroupPropertiesForFlags(
+        call: MethodCall,
+        result: Result,
+    ) {
+        try {
+            val groupType: String? = call.argument("groupType")
+            PostHog.resetGroupPropertiesForFlags(groupType, reloadFeatureFlags = false)
             result.success(null)
         } catch (e: Throwable) {
             result.error("PosthogFlutterException", e.localizedMessage, null)
@@ -711,6 +1296,24 @@ class PosthogFlutterPlugin :
             result.success(null)
         } catch (e: Throwable) {
             result.error("CAPTURE_EXCEPTION_ERROR", "Failed to capture exception: ${e.message}", null)
+        }
+    }
+
+    private fun addExceptionStep(
+        call: MethodCall,
+        result: Result,
+    ) {
+        try {
+            val message: String =
+                call.argument("message") ?: run {
+                    result.error("PosthogFlutterException", "Missing argument: message", null)
+                    return
+                }
+            val properties: Map<String, Any>? = call.argument("properties")
+            PostHog.addExceptionStep(message, properties)
+            result.success(null)
+        } catch (e: Throwable) {
+            result.error("PosthogFlutterException", e.localizedMessage, null)
         }
     }
 

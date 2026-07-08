@@ -2,6 +2,7 @@ import PostHog
 #if os(iOS)
     import Flutter
     import UIKit
+    import WebKit
 #elseif os(macOS)
     import AppKit
     import FlutterMacOS
@@ -61,7 +62,8 @@ public class PosthogFlutterPlugin: NSObject, FlutterPlugin {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         if Bundle.main.object(forInfoDictionaryKey: "com.posthog.posthog.PROJECT_TOKEN") == nil,
-           Bundle.main.object(forInfoDictionaryKey: "com.posthog.posthog.API_KEY") != nil {
+           Bundle.main.object(forInfoDictionaryKey: "com.posthog.posthog.API_KEY") != nil
+        {
             print("[PostHog] com.posthog.posthog.API_KEY is deprecated and will be removed in the next major version. Use com.posthog.posthog.PROJECT_TOKEN instead!")
         }
 
@@ -205,6 +207,50 @@ public class PosthogFlutterPlugin: NSObject, FlutterPlugin {
             if let inAppByDefault = errorConfig["inAppByDefault"] as? Bool {
                 config.errorTrackingConfig.inAppByDefault = inAppByDefault
             }
+
+            if let exceptionSteps = errorConfig["exceptionSteps"] as? [String: Any] {
+                if let enabled = exceptionSteps["enabled"] as? Bool {
+                    config.errorTrackingConfig.exceptionSteps.enabled = enabled
+                }
+                if let maxBytes = exceptionSteps["maxBytes"] as? Int {
+                    config.errorTrackingConfig.exceptionSteps.maxBytes = maxBytes
+                }
+            }
+        }
+
+        // Configure logs (beforeSend runs Dart-side). Each field is only present
+        // when the user set it; unset fields keep native defaults.
+        if let logsConfig = posthogConfig["logs"] as? [String: Any] {
+            if let serviceName = logsConfig["serviceName"] as? String {
+                config.logs.serviceName = serviceName
+            }
+            if let serviceVersion = logsConfig["serviceVersion"] as? String {
+                config.logs.serviceVersion = serviceVersion
+            }
+            if let environment = logsConfig["environment"] as? String {
+                config.logs.environment = environment
+            }
+            if let resourceAttributes = logsConfig["resourceAttributes"] as? [String: Any] {
+                config.logs.resourceAttributes = resourceAttributes
+            }
+            if let flushIntervalSeconds = logsConfig["flushIntervalSeconds"] as? Int {
+                config.logs.flushIntervalSeconds = TimeInterval(flushIntervalSeconds)
+            }
+            if let flushAt = logsConfig["flushAt"] as? Int {
+                config.logs.flushAt = flushAt
+            }
+            if let maxBatchSize = logsConfig["maxBatchSize"] as? Int {
+                config.logs.maxBatchSize = maxBatchSize
+            }
+            if let maxBufferSize = logsConfig["maxBufferSize"] as? Int {
+                config.logs.maxBufferSize = maxBufferSize
+            }
+            if let rateCapMaxLogs = logsConfig["rateCapMaxLogs"] as? Int {
+                config.logs.rateCapMaxLogs = rateCapMaxLogs
+            }
+            if let rateCapWindowSeconds = logsConfig["rateCapWindowSeconds"] as? Int {
+                config.logs.rateCapWindowSeconds = TimeInterval(rateCapWindowSeconds)
+            }
         }
 
         // Update SDK name and version
@@ -239,6 +285,8 @@ public class PosthogFlutterPlugin: NSObject, FlutterPlugin {
             capture(call, result: result)
         case "screen":
             screen(call, result: result)
+        case "captureLog":
+            captureLog(call, result: result)
         case "alias":
             alias(call, result: result)
         case "distinctId":
@@ -255,6 +303,14 @@ public class PosthogFlutterPlugin: NSObject, FlutterPlugin {
             debug(call, result: result)
         case "reloadFeatureFlags":
             reloadFeatureFlags(result)
+        case "setPersonPropertiesForFlags":
+            setPersonPropertiesForFlags(call, result: result)
+        case "resetPersonPropertiesForFlags":
+            resetPersonPropertiesForFlags(result)
+        case "setGroupPropertiesForFlags":
+            setGroupPropertiesForFlags(call, result: result)
+        case "resetGroupPropertiesForFlags":
+            resetGroupPropertiesForFlags(call, result: result)
         case "group":
             group(call, result: result)
         case "register":
@@ -265,12 +321,18 @@ public class PosthogFlutterPlugin: NSObject, FlutterPlugin {
             flush(result)
         case "captureException":
             captureException(call, result: result)
+        case "addExceptionStep":
+            addExceptionStep(call, result: result)
         case "close":
             close(result)
         case "sendMetaEvent":
             sendMetaEvent(call, result: result)
         case "sendFullSnapshot":
             sendFullSnapshot(call, result: result)
+        case "captureNativeScreenshot":
+            captureNativeScreenshot(call, result: result)
+        case "captureNativeScreenshots":
+            captureNativeScreenshots(call, result: result)
         case "isSessionReplayActive":
             isSessionReplayActive(result: result)
         case "startSessionRecording":
@@ -405,6 +467,161 @@ public class PosthogFlutterPlugin: NSObject, FlutterPlugin {
 #endif
 
 extension PosthogFlutterPlugin {
+    private func captureNativeScreenshot(_ call: FlutterMethodCall,
+                                         result: @escaping FlutterResult)
+    {
+        #if os(iOS)
+            guard let args = call.arguments as? [String: Any] else {
+                _badArgumentError(result)
+                return
+            }
+            let x = args["x"] as? Int ?? 0
+            let y = args["y"] as? Int ?? 0
+            let width = args["width"] as? Int ?? 0
+            let height = args["height"] as? Int ?? 0
+            guard width > 0, height > 0 else {
+                _badArgumentError(result)
+                return
+            }
+            captureOneNative(x: x, y: y, width: width, height: height) { bytes in
+                result(bytes)
+            }
+        #else
+            result(nil)
+        #endif
+    }
+
+    private func captureNativeScreenshots(_ call: FlutterMethodCall,
+                                          result: @escaping FlutterResult)
+    {
+        #if os(iOS)
+            guard let args = call.arguments as? [String: Any],
+                  let views = args["views"] as? [[String: Int]]
+            else {
+                result([])
+                return
+            }
+            captureNextNative(views: views, index: 0, acc: []) { results in
+                result(results)
+            }
+        #else
+            result([])
+        #endif
+    }
+
+    #if os(iOS)
+        private func captureOneNative(x: Int, y: Int, width: Int, height: Int,
+                                      onResult: @escaping (FlutterStandardTypedData?) -> Void)
+        {
+            DispatchQueue.main.async {
+                guard let window = self.captureWindow() else {
+                    onResult(nil)
+                    return
+                }
+
+                // If a native VC is presented over Flutter (paywall, system sheet,
+                // etc.) Flutter has no widget rects for it, so capturing would
+                // include unmasked native content. Fall back to Flutter-only.
+                if window.rootViewController?.presentedViewController != nil {
+                    onResult(nil)
+                    return
+                }
+
+                let cropRect = CGRect(x: x, y: y, width: width, height: height)
+                    .intersection(window.bounds)
+                guard !cropRect.isNull, !cropRect.isEmpty else {
+                    onResult(nil)
+                    return
+                }
+
+                // Only reveal a web view that the capture rect fully covers, and
+                // snapshot only the crop region. Requiring containment (not mere
+                // intersection) stops a neighboring MASKED web view that overlaps
+                // this captured view's rect from being snapshotted and leaked.
+                if let webView = self.findWKWebView(in: window, containedBy: cropRect) {
+                    let config = WKSnapshotConfiguration()
+                    config.rect = webView.convert(cropRect, from: nil).intersection(webView.bounds)
+                    guard !config.rect.isNull, !config.rect.isEmpty else {
+                        onResult(nil)
+                        return
+                    }
+                    webView.takeSnapshot(with: config) { snapshotImage, error in
+                        guard error == nil, let snapshotImage = snapshotImage else {
+                            onResult(nil)
+                            return
+                        }
+                        onResult(self.imageToRawRgba(snapshotImage).map(FlutterStandardTypedData.init(bytes:)))
+                    }
+                    return
+                }
+
+                // No WKWebView found for the captured rect. Returning nil here
+                // keeps this safe: drawHierarchy over the full window would
+                // include any masked CALayer-backed platform view overlapping
+                // the crop region and leak it into replay.
+                onResult(nil)
+            }
+        }
+
+        private func captureNextNative(views: [[String: Int]], index: Int,
+                                       acc: [FlutterStandardTypedData?],
+                                       completion: @escaping ([FlutterStandardTypedData?]) -> Void)
+        {
+            guard index < views.count else {
+                completion(acc)
+                return
+            }
+            let v = views[index]
+            let x = v["x"] ?? 0
+            let y = v["y"] ?? 0
+            let width = v["width"] ?? 0
+            let height = v["height"] ?? 0
+            captureOneNative(x: x, y: y, width: width, height: height) { bytes in
+                self.captureNextNative(views: views, index: index + 1, acc: acc + [bytes], completion: completion)
+            }
+        }
+
+        private func imageToRawRgba(_ image: UIImage) -> Data? {
+            guard let cgImage = image.cgImage else { return nil }
+            // image.size is in points; cgImage.width/height are physical pixels (2×/3× on Retina).
+            // Dart decodes at logical-pixel dimensions, so the buffer must be point-sized.
+            let width = Int(image.size.width)
+            let height = Int(image.size.height)
+            let bytesPerRow = width * 4
+            var buffer = [UInt8](repeating: 0, count: height * bytesPerRow)
+            guard let context = CGContext(
+                data: &buffer,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            ) else { return nil }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+            return Data(buffer)
+        }
+
+        private func captureWindow() -> UIWindow? {
+            return UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+                .first(where: \.isKeyWindow) ?? UIApplication.shared.windows.first
+        }
+
+        private func findWKWebView(in view: UIView, containedBy rect: CGRect) -> WKWebView? {
+            if let webView = view as? WKWebView {
+                let frameInWindow = webView.convert(webView.bounds, to: nil)
+                // 1pt slack absorbs rounding between Flutter's rect and the native frame.
+                if rect.insetBy(dx: -1, dy: -1).contains(frameInWindow) { return webView }
+            }
+            for sub in view.subviews {
+                if let found = findWKWebView(in: sub, containedBy: rect) { return found }
+            }
+            return nil
+        }
+    #endif
+
     private func sendMetaEvent(_ call: FlutterMethodCall,
                                result: @escaping FlutterResult)
     {
@@ -711,6 +928,50 @@ extension PosthogFlutterPlugin {
         }
     }
 
+    private func captureLog(
+        _ call: FlutterMethodCall,
+        result: @escaping FlutterResult
+    ) {
+        if let args = call.arguments as? [String: Any],
+           let body = args["body"] as? String
+        {
+            let level = args["level"] as? String ?? "info"
+            let attributes = args["attributes"] as? [String: Any]
+            let traceId = args["traceId"] as? String
+            let spanId = args["spanId"] as? String
+            // traceFlags 0 is meaningful (W3C sampled-false); nil omits it.
+            let traceFlags = args["traceFlags"] as? Int
+            // PostHogLogSeverity.from(name:) is internal in the SDK, so map the
+            // wire string here. Unknown levels fall back to .info.
+            let severity = severityFromString(level)
+            PostHogSDK.shared.captureLog(
+                body,
+                level: severity,
+                attributes: attributes,
+                traceId: traceId,
+                spanId: spanId,
+                traceFlags: traceFlags
+            )
+            result(nil)
+        } else {
+            _badArgumentError(result)
+        }
+    }
+
+    // Maps the wire level to PostHogLogSeverity using only public enum cases
+    // (the SDK's `from(name:)` is internal). Unknown levels fall back to .info.
+    private func severityFromString(_ level: String) -> PostHogLogSeverity {
+        switch level.lowercased() {
+        case "trace": return .trace
+        case "debug": return .debug
+        case "info": return .info
+        case "warn": return .warn
+        case "error": return .error
+        case "fatal": return .fatal
+        default: return .info
+        }
+    }
+
     private func alias(
         _ call: FlutterMethodCall,
         result: @escaping FlutterResult
@@ -765,7 +1026,61 @@ extension PosthogFlutterPlugin {
     }
 
     private func reloadFeatureFlags(_ result: @escaping FlutterResult) {
-        PostHogSDK.shared.reloadFeatureFlags()
+        // Resolve the Dart Future only once flags have actually finished loading.
+        // The native callback fires on a background thread, so hop to main for Flutter.
+        PostHogSDK.shared.reloadFeatureFlags {
+            DispatchQueue.main.async {
+                result(nil)
+            }
+        }
+    }
+
+    // reloadFeatureFlags is handled on the Dart side (so the Future resolves only
+    // after the awaited reload completes), so we always disable the native reload.
+    private func setPersonPropertiesForFlags(
+        _ call: FlutterMethodCall,
+        result: @escaping FlutterResult
+    ) {
+        if let args = call.arguments as? [String: Any],
+           let userProperties = args["userProperties"] as? [String: Any]
+        {
+            PostHogSDK.shared.setPersonPropertiesForFlags(userProperties, reloadFeatureFlags: false)
+            result(nil)
+        } else {
+            _badArgumentError(result)
+        }
+    }
+
+    private func resetPersonPropertiesForFlags(_ result: @escaping FlutterResult) {
+        PostHogSDK.shared.resetPersonPropertiesForFlags(reloadFeatureFlags: false)
+        result(nil)
+    }
+
+    private func setGroupPropertiesForFlags(
+        _ call: FlutterMethodCall,
+        result: @escaping FlutterResult
+    ) {
+        if let args = call.arguments as? [String: Any],
+           let groupType = args["groupType"] as? String,
+           let groupProperties = args["groupProperties"] as? [String: Any]
+        {
+            PostHogSDK.shared.setGroupPropertiesForFlags(groupType, properties: groupProperties, reloadFeatureFlags: false)
+            result(nil)
+        } else {
+            _badArgumentError(result)
+        }
+    }
+
+    private func resetGroupPropertiesForFlags(
+        _ call: FlutterMethodCall,
+        result: @escaping FlutterResult
+    ) {
+        let groupType = (call.arguments as? [String: Any])?["groupType"] as? String
+        if let groupType = groupType {
+            PostHogSDK.shared.resetGroupPropertiesForFlags(groupType, reloadFeatureFlags: false)
+        } else {
+            PostHogSDK.shared.resetGroupPropertiesForFlags(reloadFeatureFlags: false)
+        }
         result(nil)
     }
 
@@ -835,6 +1150,19 @@ extension PosthogFlutterPlugin {
 
         // Use capture method with timestamp to ensure Flutter timestamp is used
         PostHogSDK.shared.capture("$exception", properties: properties, timestamp: timestamp)
+        result(nil)
+    }
+
+    private func addExceptionStep(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let arguments = call.arguments as? [String: Any],
+              let message = arguments["message"] as? String
+        else {
+            _badArgumentError(result)
+            return
+        }
+
+        let properties = arguments["properties"] as? [String: Any]
+        PostHogSDK.shared.addExceptionStep(message, properties: properties)
         result(nil)
     }
 

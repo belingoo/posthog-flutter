@@ -10,10 +10,12 @@ import 'package:posthog_flutter/src/util/logging.dart';
 import 'surveys/models/posthog_display_survey.dart' as models;
 import 'surveys/models/survey_callbacks.dart';
 import 'error_tracking/dart_exception_processor.dart';
+import 'utils/before_send.dart';
 import 'utils/capture_utils.dart';
 import 'utils/property_normalizer.dart';
 
 import 'feature_flag_result.dart';
+import 'logs/posthog_log_severity.dart';
 import 'posthog_config.dart';
 import 'posthog_constants.dart';
 import 'posthog_event.dart';
@@ -54,30 +56,16 @@ class PosthogFlutterIO extends PosthogFlutterPlatformInterface {
     if (_beforeSendCallbacks.isEmpty) return event;
 
     for (final callback in _beforeSendCallbacks) {
-      final result = await _applyBeforeSendCallback(callback, event);
-      if (result == null) return null;
-      event = result;
+      try {
+        final result = await runBeforeSend<PostHogEvent>(callback, event);
+        if (result == null) return null;
+        event = result;
+      } catch (e) {
+        // Skip a throwing callback; continue with the pre-callback event.
+        printIfDebug('[PostHog] beforeSend callback threw exception: $e');
+      }
     }
     return event;
-  }
-
-  /// Applies a single beforeSend callback safely.
-  /// Returns null if event should be dropped, otherwise returns the (possibly modified) event.
-  /// Handles both synchronous and asynchronous callbacks via FutureOr.
-  Future<PostHogEvent?> _applyBeforeSendCallback(
-    BeforeSendCallback callback,
-    PostHogEvent event,
-  ) async {
-    try {
-      final callbackResult = callback(event);
-      if (callbackResult is Future<PostHogEvent?>) {
-        return await callbackResult;
-      }
-      return callbackResult;
-    } catch (e) {
-      printIfDebug('[PostHog] beforeSend callback threw exception: $e');
-      return event;
-    }
   }
 
   /// Native plugin calls to Flutter
@@ -379,6 +367,39 @@ class PosthogFlutterIO extends PosthogFlutterPlatformInterface {
   }
 
   @override
+  Future<void> captureLog({
+    required String body,
+    PostHogLogSeverity level = PostHogLogSeverity.info,
+    Map<String, Object>? attributes,
+    String? traceId,
+    String? spanId,
+    int? traceFlags,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedAttributes =
+          attributes != null ? PropertyNormalizer.normalize(attributes) : null;
+
+      // Trace fields are camelCase here; the web handler remaps them to
+      // snake_case for posthog-js.
+      await _methodChannel.invokeMethod('captureLog', {
+        'body': body,
+        'level': level.name,
+        if (normalizedAttributes != null) 'attributes': normalizedAttributes,
+        if (traceId != null) 'traceId': traceId,
+        if (spanId != null) 'spanId': spanId,
+        // traceFlags 0 is meaningful (W3C sampled-false); only omit when null.
+        if (traceFlags != null) 'traceFlags': traceFlags,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on captureLog: $exception');
+    }
+  }
+
+  @override
   Future<void> alias({required String alias}) async {
     if (!isSupportedPlatform()) {
       return;
@@ -498,6 +519,76 @@ class PosthogFlutterIO extends PosthogFlutterPlatformInterface {
       await _methodChannel.invokeMethod('reloadFeatureFlags');
     } on PlatformException catch (exception) {
       printIfDebug('Exeption on reloadFeatureFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> setPersonPropertiesForFlags(
+    Map<String, Object> userProperties,
+  ) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedUserProperties =
+          PropertyNormalizer.normalize(userProperties);
+
+      await _methodChannel.invokeMethod('setPersonPropertiesForFlags', {
+        'userProperties': normalizedUserProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on setPersonPropertiesForFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> resetPersonPropertiesForFlags() async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('resetPersonPropertiesForFlags');
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on resetPersonPropertiesForFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> setGroupPropertiesForFlags(
+    String groupType,
+    Map<String, Object> groupProperties,
+  ) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedGroupProperties =
+          PropertyNormalizer.normalize(groupProperties);
+
+      await _methodChannel.invokeMethod('setGroupPropertiesForFlags', {
+        'groupType': groupType,
+        'groupProperties': normalizedGroupProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on setGroupPropertiesForFlags: $exception');
+    }
+  }
+
+  @override
+  Future<void> resetGroupPropertiesForFlags({String? groupType}) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      await _methodChannel.invokeMethod('resetGroupPropertiesForFlags', {
+        if (groupType != null) 'groupType': groupType,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on resetGroupPropertiesForFlags: $exception');
     }
   }
 
@@ -677,6 +768,28 @@ class PosthogFlutterIO extends PosthogFlutterPlatformInterface {
       });
     } on PlatformException catch (exception) {
       printIfDebug('Exception in captureException: $exception');
+    }
+  }
+
+  @override
+  Future<void> addExceptionStep(
+    String message, {
+    Map<String, Object>? properties,
+  }) async {
+    if (!isSupportedPlatform()) {
+      return;
+    }
+
+    try {
+      final normalizedProperties =
+          properties != null ? PropertyNormalizer.normalize(properties) : null;
+
+      await _methodChannel.invokeMethod('addExceptionStep', {
+        'message': message,
+        if (normalizedProperties != null) 'properties': normalizedProperties,
+      });
+    } on PlatformException catch (exception) {
+      printIfDebug('Exception on addExceptionStep: $exception');
     }
   }
 

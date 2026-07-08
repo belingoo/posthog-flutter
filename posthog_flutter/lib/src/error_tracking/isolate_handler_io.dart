@@ -1,3 +1,7 @@
+// Portions of this file are derived from getsentry/sentry-dart
+// Copyright (c) 2020 Sentry
+// Licensed under the MIT License: https://github.com/getsentry/sentry-dart/blob/main/LICENSE
+
 import 'dart:isolate';
 
 // ignore: unnecessary_import

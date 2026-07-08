@@ -5,10 +5,14 @@ import 'package:meta/meta.dart';
 import 'package:posthog_flutter/src/error_tracking/posthog_error_tracking_autocapture_integration.dart';
 import 'package:posthog_flutter/src/error_tracking/posthog_exception.dart';
 import 'feature_flag_result.dart';
+import 'logs/posthog_log_record.dart';
+import 'logs/posthog_log_severity.dart';
+import 'logs/posthog_logger.dart';
 import 'posthog_config.dart';
 import 'posthog_flutter_platform_interface.dart';
 import 'posthog_internal_events.dart';
 import 'posthog_observer.dart';
+import 'utils/before_send.dart';
 
 /// Entry point for the PostHog Flutter SDK.
 ///
@@ -227,6 +231,110 @@ class Posthog {
     return _posthog.screen(screenName: screenName, properties: properties);
   }
 
+  /// Captures a structured log record.
+  ///
+  /// Docs: https://posthog.com/docs/logs
+  ///
+  /// `captureLog` is not gated by remote config.
+  ///
+  /// The [body] is the log message. A blank body is dropped before
+  /// [PostHogLogsConfig.beforeSend] runs.
+  ///
+  /// The optional [level] is the severity, defaulting to
+  /// [PostHogLogSeverity.info].
+  ///
+  /// The optional [attributes] are per-record attributes (e.g. request id,
+  /// duration). Values must be supported by the platform channel serializer.
+  ///
+  /// The optional [traceId], [spanId], and [traceFlags] are W3C distributed
+  /// tracing fields used to correlate a log with a trace. [traceId] is a
+  /// 32-character lowercase hex string, [spanId] is 16 characters, and
+  /// [traceFlags] is a bitfield whose bit 0 is the `sampled` flag (an explicit
+  /// `0` is emitted; `null` omits the field). They pass through unchanged and
+  /// are not visible to [PostHogLogsConfig.beforeSend].
+  ///
+  /// Auto-captured context (distinct id, session id, screen name, app state,
+  /// active feature flags) is added by the native SDK.
+  ///
+  /// Records are passed through [PostHogLogsConfig.beforeSend] before being
+  /// forwarded to the native SDK; a callback may modify or drop them.
+  ///
+  /// Returns a [Future] that completes when the record has been forwarded.
+  ///
+  /// **Example:**
+  /// ```dart
+  /// await Posthog().captureLog(
+  ///   body: 'checkout completed',
+  ///   level: PostHogLogSeverity.info,
+  ///   attributes: {'order_id': 'ord_789'},
+  /// );
+  /// ```
+  Future<void> captureLog({
+    required String body,
+    PostHogLogSeverity level = PostHogLogSeverity.info,
+    Map<String, Object>? attributes,
+    String? traceId,
+    String? spanId,
+    int? traceFlags,
+  }) async {
+    if (body.trim().isEmpty) {
+      return;
+    }
+
+    var record = PostHogLogRecord(
+      body: body,
+      level: level,
+      attributes: attributes == null ? null : {...attributes},
+    );
+
+    final callbacks =
+        _config?.logsConfig.beforeSend ?? const <BeforeSendLogCallback>[];
+    for (final callback in callbacks) {
+      try {
+        final result = await runBeforeSend<PostHogLogRecord>(callback, record);
+        if (result == null) {
+          debugPrint('[PostHog] Log dropped by beforeSend');
+          return;
+        }
+        record = result;
+      } catch (e) {
+        debugPrint('[PostHog] beforeSend threw, dropping log: $e');
+        return;
+      }
+    }
+
+    // A beforeSend callback may have blanked the body, which drops the record.
+    if (record.body.trim().isEmpty) {
+      return;
+    }
+
+    return _posthog.captureLog(
+      body: record.body,
+      level: record.level,
+      attributes: record.attributes,
+      traceId: traceId,
+      spanId: spanId,
+      traceFlags: traceFlags,
+    );
+  }
+
+  PostHogLogger? _logger;
+
+  /// Per-level logger facade for capturing structured logs.
+  ///
+  /// Each helper delegates to [captureLog] with the matching severity. Built
+  /// once on first access and cached.
+  ///
+  /// **Example:**
+  /// ```dart
+  /// Posthog().logger.info('user signed in', {'method': 'google'});
+  /// Posthog().logger.error('payment failed', {'error_code': 'E001'});
+  /// ```
+  PostHogLogger get logger => _logger ??= PostHogLogger(
+        (body, level, attributes) =>
+            captureLog(body: body, level: level, attributes: attributes),
+      );
+
   /// Creates an alias for the current user.
   ///
   /// Docs:
@@ -311,6 +419,118 @@ class Posthog {
   ///
   /// Returns a [Future] that completes when the reload request has been queued.
   Future<void> reloadFeatureFlags() => _posthog.reloadFeatureFlags();
+
+  /// Sets person properties that are used only for feature flag evaluation.
+  ///
+  /// Docs: https://posthog.com/docs/feature-flags
+  ///
+  /// Unlike [setPersonProperties], this does **not** enqueue a `$set` event. The
+  /// properties are sent inline with the next feature flag evaluation request,
+  /// so flags that target these properties can be evaluated immediately without
+  /// waiting for the `$set` event to be ingested into the person store.
+  ///
+  /// The [userProperties] are merged with any previously set values; matching
+  /// keys are overwritten. If [userProperties] is empty, this is a no-op.
+  ///
+  /// Set [reloadFeatureFlags] to `false` to skip reloading flags after updating
+  /// the properties (defaults to `true`). When `true`, the returned [Future]
+  /// awaits the reload before completing; on iOS and Android this means flags
+  /// have finished loading, so the next [getFeatureFlag] / [getFeatureFlagResult]
+  /// reflects the updated properties. On web the reload is best-effort.
+  ///
+  /// **Example:**
+  /// ```dart
+  /// await Posthog().setPersonPropertiesForFlags({
+  ///   "storefront_country": "US",
+  ///   "superwall_demand_score": 88,
+  /// });
+  /// final result = await Posthog().getFeatureFlagResult("my_flag");
+  /// ```
+  Future<void> setPersonPropertiesForFlags(
+    Map<String, Object> userProperties, {
+    bool reloadFeatureFlags = true,
+  }) async {
+    if (userProperties.isEmpty) {
+      return;
+    }
+    await _posthog.setPersonPropertiesForFlags(userProperties);
+    if (reloadFeatureFlags) {
+      await this.reloadFeatureFlags();
+    }
+  }
+
+  /// Clears all person properties that were set for feature flag evaluation via
+  /// [setPersonPropertiesForFlags].
+  ///
+  /// Set [reloadFeatureFlags] to `false` to skip reloading flags after clearing
+  /// the properties (defaults to `true`). When `true`, the returned [Future]
+  /// awaits the reload before completing (on iOS/Android, after flags finish
+  /// loading; on web, best-effort).
+  Future<void> resetPersonPropertiesForFlags({
+    bool reloadFeatureFlags = true,
+  }) async {
+    await _posthog.resetPersonPropertiesForFlags();
+    if (reloadFeatureFlags) {
+      await this.reloadFeatureFlags();
+    }
+  }
+
+  /// Sets properties for a specific [groupType] that are used only for feature
+  /// flag evaluation.
+  ///
+  /// The properties are sent inline with the next feature flag evaluation
+  /// request, so flags that target group properties can be evaluated without
+  /// waiting for ingestion.
+  ///
+  /// The [groupProperties] are merged with any previously set values for the
+  /// same [groupType]; matching keys are overwritten. If [groupProperties] is
+  /// empty, this is a no-op.
+  ///
+  /// Set [reloadFeatureFlags] to `false` to skip reloading flags after updating
+  /// the properties (defaults to `true`). When `true`, the returned [Future]
+  /// awaits the reload before completing (on iOS/Android, after flags finish
+  /// loading; on web, best-effort).
+  ///
+  /// **Example:**
+  /// ```dart
+  /// await Posthog().setGroupPropertiesForFlags(
+  ///   "organization",
+  ///   {"name": "ACME Corp", "is_enterprise": true},
+  /// );
+  /// ```
+  Future<void> setGroupPropertiesForFlags(
+    String groupType,
+    Map<String, Object> groupProperties, {
+    bool reloadFeatureFlags = true,
+  }) async {
+    if (groupProperties.isEmpty) {
+      return;
+    }
+    await _posthog.setGroupPropertiesForFlags(groupType, groupProperties);
+    if (reloadFeatureFlags) {
+      await this.reloadFeatureFlags();
+    }
+  }
+
+  /// Clears group properties that were set for feature flag evaluation via
+  /// [setGroupPropertiesForFlags].
+  ///
+  /// If [groupType] is provided, only properties for that group type are
+  /// cleared; otherwise all group properties are cleared.
+  ///
+  /// Set [reloadFeatureFlags] to `false` to skip reloading flags after clearing
+  /// the properties (defaults to `true`). When `true`, the returned [Future]
+  /// awaits the reload before completing (on iOS/Android, after flags finish
+  /// loading; on web, best-effort).
+  Future<void> resetGroupPropertiesForFlags({
+    String? groupType,
+    bool reloadFeatureFlags = true,
+  }) async {
+    await _posthog.resetGroupPropertiesForFlags(groupType: groupType);
+    if (reloadFeatureFlags) {
+      await this.reloadFeatureFlags();
+    }
+  }
 
   /// Associates the current user with a group.
   ///
@@ -439,6 +659,56 @@ class Posthog {
       stackTrace: stackTrace,
       properties: properties,
     );
+  }
+
+  /// Records an exception step (breadcrumb-style context record).
+  ///
+  /// Steps accumulate in a rolling, byte-bounded buffer and are attached to
+  /// every captured `$exception` event as `$exception_steps`, giving the
+  /// PostHog error-tracking UI a timeline of recent activity leading up to each
+  /// error. The buffer rotates only by byte-budget eviction (see
+  /// [PostHogExceptionStepsConfig.maxBytes]) and is not cleared by a capture or
+  /// an identity change.
+  ///
+  /// The buffer is owned by the embedded native SDK, so steps also survive
+  /// native fatal crashes and attach to the crash `$exception` reported on the
+  /// next launch.
+  ///
+  /// The [message] is a short, non-empty description of what happened; an empty
+  /// or whitespace-only message is ignored. The optional [properties] are
+  /// additional context. The reserved keys `$message` and `$timestamp` are
+  /// stripped — the SDK sets the canonical values, including a timestamp
+  /// captured when the step is recorded.
+  ///
+  /// Recording never throws into your app and does not block the caller.
+  ///
+  /// **Note:**
+  /// - Flutter web: forwarded to posthog-js. Steps attach to exceptions
+  ///   captured by posthog-js, but not to exceptions captured via
+  ///   [captureException] on web.
+  ///
+  /// **Example:**
+  /// ```dart
+  /// Posthog().addExceptionStep(
+  ///   'User tapped Checkout',
+  ///   properties: {'screen': 'cart'},
+  /// );
+  /// ```
+  Future<void> addExceptionStep(
+    String message, {
+    Map<String, Object>? properties,
+  }) {
+    if (message.trim().isEmpty) {
+      debugPrint('[PostHog] addExceptionStep called with an empty message.');
+      return Future<void>.value();
+    }
+    // Honor the documented no-op contract on every platform: native enforces
+    // `enabled` via the config forwarded at setup, but on web `setup` doesn't
+    // push it to posthog-js, so guard here too.
+    if (_config?.errorTrackingConfig.exceptionSteps.enabled == false) {
+      return Future<void>.value();
+    }
+    return _posthog.addExceptionStep(message, properties: properties);
   }
 
   /// Closes the PostHog SDK and cleans up resources.

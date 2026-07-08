@@ -6,7 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:posthog_flutter/posthog_flutter.dart';
 import 'package:posthog_flutter_example/error_example.dart';
 
+import 'exception_steps_screen.dart';
 import 'masking_tests_screen.dart';
+import 'platform_views_screen.dart';
+
+const kMaskAllPlatformViews = true;
 
 Future<void> main() async {
   final config = PostHogConfig(
@@ -43,9 +47,10 @@ Future<void> main() async {
   config.captureApplicationLifecycleEvents = false;
   config.host = 'https://us.i.posthog.com';
   config.surveys = false;
-  config.sessionReplay = false;
+  config.sessionReplay = true;
   config.sessionReplayConfig.maskAllTexts = false;
   config.sessionReplayConfig.maskAllImages = false;
+  config.sessionReplayConfig.maskAllPlatformViews = kMaskAllPlatformViews;
   config.sessionReplayConfig.throttleDelay = const Duration(milliseconds: 1000);
   config.flushAt = 1;
 
@@ -161,6 +166,40 @@ class InitialScreenState extends State<InitialScreen> {
                   },
                   child: const Text('Masking Tests'),
                 ),
+                const SizedBox(height: 8),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.indigo,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const ExceptionStepsScreen(),
+                        settings: const RouteSettings(name: 'exception_steps'),
+                      ),
+                    );
+                  },
+                  child: const Text('Exception Steps'),
+                ),
+                const SizedBox(height: 8),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => const PlatformViewsScreen(),
+                        settings: const RouteSettings(name: 'platform_views'),
+                      ),
+                    );
+                  },
+                  child: const Text('Platform Views (Replay)'),
+                ),
                 const Padding(
                   padding: EdgeInsets.all(8.0),
                   child: Text(
@@ -194,6 +233,39 @@ class InitialScreenState extends State<InitialScreen> {
                         );
                       },
                       child: const Text("Capture Event"),
+                    ),
+                  ],
+                ),
+                const Divider(),
+                const Padding(
+                  padding: EdgeInsets.all(8.0),
+                  child: Text(
+                    "Logs",
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+                Wrap(
+                  alignment: WrapAlignment.spaceEvenly,
+                  spacing: 8.0,
+                  runSpacing: 8.0,
+                  children: [
+                    ElevatedButton(
+                      onPressed: () {
+                        _posthogFlutterPlugin.captureLog(
+                          body: "checkout completed",
+                          level: PostHogLogSeverity.info,
+                          attributes: {"order_id": "ord_789"},
+                        );
+                      },
+                      child: const Text("Capture Log (info)"),
+                    ),
+                    ElevatedButton(
+                      onPressed: () {
+                        _posthogFlutterPlugin.logger.error("payment failed", {
+                          "error_code": "E001",
+                        });
+                      },
+                      child: const Text("logger.error"),
                     ),
                   ],
                 ),
@@ -269,6 +341,36 @@ class InitialScreenState extends State<InitialScreen> {
                     );
                   },
                   child: const Text("Group"),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    await _posthogFlutterPlugin.setPersonPropertiesForFlags({
+                      "storefront_country": "US",
+                      "demand_score": 88,
+                    });
+                  },
+                  child: const Text("Set person properties for flags"),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    await _posthogFlutterPlugin.resetPersonPropertiesForFlags();
+                  },
+                  child: const Text("Reset person properties for flags"),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    await _posthogFlutterPlugin.setGroupPropertiesForFlags(
+                      "theType",
+                      {"is_enterprise": true},
+                    );
+                  },
+                  child: const Text("Set group properties for flags"),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    await _posthogFlutterPlugin.resetGroupPropertiesForFlags();
+                  },
+                  child: const Text("Reset group properties for flags"),
                 ),
                 ElevatedButton(
                   onPressed: () async {

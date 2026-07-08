@@ -1,5 +1,79 @@
 ## Next
 
+## 5.30.0
+
+### Minor Changes
+
+- b851632: Improve error-tracking cause handling: `captureException` now walks an error's cause chain (`AsyncError`, all enumerable `ParallelWaitError` failures, and exceptions exposing a `cause` getter) into multiple `$exception_list` items, outermost-first (wrapper first, root cause last), with a cycle guard and a depth cap of 10.
+
+## 5.29.0
+
+### Minor Changes
+
+- de7b5e8: Platform views are now masked by default in session replay (they now appear as a black box). Use `maskAllPlatformViews = false` to disable masking globally, or wrap individual views in `PostHogPlatformView(privacy: PostHogPlatformViewPrivacy.capture)` to reveal them selectively.
+
+## 5.28.0
+
+### Minor Changes
+
+- 3fe9ab2: Add `addExceptionStep`, recording breadcrumb-style context records that attach to every captured `$exception` as `$exception_steps`, giving the error-tracking UI a timeline of recent activity leading up to each error.
+
+  Steps accumulate in a rolling, byte-bounded buffer owned by the embedded native SDK, so they also survive native fatal crashes and attach to the crash `$exception` reported on the next launch. The buffer rotates only by byte-budget eviction and is not cleared by a capture or an identity change. Configure it on `config.errorTrackingConfig.exceptionSteps` (`enabled`, `maxBytes`).
+
+  ```dart
+  Posthog().addExceptionStep('User tapped Checkout', properties: {'screen': 'cart'});
+  ```
+
+  Requires `posthog-android` and `posthog-ios` versions that support exception steps. On web, steps are forwarded to posthog-js, and exceptions captured via `captureException` now route through posthog-js's `captureException` (instead of a generic `$exception` capture) so steps and other required metadata attach.
+
+## 5.27.0
+
+### Minor Changes
+
+- 647d48b: Add structured logging. Send logs to PostHog from your Flutter app and see them next to your events and session replays.
+
+  ```dart
+  Posthog().logger.info('checkout completed', {'order_id': 'ord_789'});
+  Posthog().logger.error('payment failed', {'error_code': 'E001'});
+
+  // Or pick the level at runtime:
+  await Posthog().captureLog(body: 'request finished', level: PostHogLogSeverity.warn);
+  ```
+
+  Levels: `trace`, `debug`, `info`, `warn`, `error`, `fatal`. Configure service identity, redaction (`beforeSend`), and batching/rate-cap tuning on `config.logsConfig` — all optional, with sensible native defaults. Works on iOS, Android, and web.
+
+  Requires `posthog-android` `3.48.0` or newer.
+
+  See https://posthog.com/docs/logs for details.
+
+## 5.26.0
+
+### Minor Changes
+
+- 4749dd4: Add `setPersonPropertiesForFlags`, `resetPersonPropertiesForFlags`, `setGroupPropertiesForFlags`, and `resetGroupPropertiesForFlags`, bringing the Flutter SDK to parity with the native iOS/Android and JS SDKs.
+
+  These set person/group properties that are sent inline with the next feature flag evaluation request, so flags targeting those properties can be evaluated immediately — without enqueuing a `$set` event or waiting for it to be ingested into the person store. By default they reload feature flags and the returned `Future` completes only after the reload finishes, so the next `getFeatureFlag`/`getFeatureFlagResult` reflects the updated properties. Pass `reloadFeatureFlags: false` to skip the reload.
+
+  ```dart
+  await Posthog().setPersonPropertiesForFlags({
+    "storefront_country": "US",
+    "superwall_demand_score": 88,
+  });
+  final result = await Posthog().getFeatureFlagResult("my_flag");
+  ```
+
+## 5.25.3
+
+### Patch Changes
+
+- 7077816: `reloadFeatureFlags()` now resolves its `Future` only after feature flags have finished loading, instead of returning immediately. `await Posthog().reloadFeatureFlags()` is now reliable, so reading a flag (or starting session recording) right after a reload sees the up-to-date result.
+
+## 5.25.2
+
+### Patch Changes
+
+- 2c0925e: Fix link-type survey questions with no URL silently failing to render on Android. The deserializer now treats a missing link as an empty string instead of throwing on `null`.
+
 ## 5.25.1
 
 ### Patch Changes
@@ -396,8 +470,8 @@ final observer = PosthogObserver(routeFilter: myRouteFilter);
 - Android minSdkVersion 21
 - iOS min version 13.0
 - Flutter min version 3.3.0
-- Upgraded PostHog Android SDK to [v3](https://github.com/PostHog/posthog-android/blob/main/USAGE.md)
-- Upgraded PostHog iOS SDK to [v3](https://github.com/PostHog/posthog-ios/blob/main/USAGE.md)
+- Upgraded PostHog Android SDK to [v3](https://posthog.com/docs/libraries/android)
+- Upgraded PostHog iOS SDK to [v3](https://posthog.com/docs/libraries/ios/usage)
 - Upgraded PostHog JS SDK to the latest version
 - PostHog Flutter Plugins are written in Kotlin and Swift
 - Added missing features such as feature flags payloads, debug, and more
@@ -437,8 +511,8 @@ final observer = PosthogObserver(routeFilter: myRouteFilter);
 - Android minSdkVersion 21
 - iOS min version 13.0
 - Flutter min version 3.3.0
-- Upgraded PostHog Android SDK to [v3](https://github.com/PostHog/posthog-android/blob/main/USAGE.md)
-- Upgraded PostHog iOS SDK to [v3 preview](https://github.com/PostHog/posthog-ios/blob/main/USAGE.md)
+- Upgraded PostHog Android SDK to [v3](https://posthog.com/docs/libraries/android)
+- Upgraded PostHog iOS SDK to [v3 preview](https://posthog.com/docs/libraries/ios/usage)
 - Upgraded PostHog JS SDK to the latest version
 - PostHog Flutter Plugins are written in Kotlin and Swift
 

@@ -10,6 +10,7 @@ import 'package:posthog_flutter/src/util/logging.dart';
 import 'package:posthog_flutter/src/utils/property_normalizer.dart';
 
 import 'src/feature_flag_result.dart';
+import 'src/logs/posthog_log_severity.dart';
 import 'src/posthog_config.dart';
 import 'src/posthog_flutter_platform_interface.dart';
 import 'src/posthog_flutter_web_handler.dart';
@@ -22,8 +23,6 @@ class PosthogFlutterWeb extends PosthogFlutterPlatformInterface {
 
   /// Stored configuration for accessing inAppIncludes and other settings
   PostHogConfig? _config;
-
-  // TODO: we should change the $lib and $lib_version to be the flutter one when capturing things
 
   static void registerWith(Registrar registrar) {
     final channel = MethodChannel(
@@ -160,6 +159,31 @@ class PosthogFlutterWeb extends PosthogFlutterPlatformInterface {
   }
 
   @override
+  Future<void> captureLog({
+    required String body,
+    PostHogLogSeverity level = PostHogLogSeverity.info,
+    Map<String, Object>? attributes,
+    String? traceId,
+    String? spanId,
+    int? traceFlags,
+  }) async {
+    final normalizedAttributes =
+        attributes != null ? PropertyNormalizer.normalize(attributes) : null;
+
+    return handleWebMethodCall(
+      MethodCall('captureLog', {
+        'body': body,
+        'level': level.name,
+        if (normalizedAttributes != null) 'attributes': normalizedAttributes,
+        if (traceId != null) 'traceId': traceId,
+        if (spanId != null) 'spanId': spanId,
+        // traceFlags 0 is meaningful (W3C sampled-false); only omit when null.
+        if (traceFlags != null) 'traceFlags': traceFlags,
+      }),
+    );
+  }
+
+  @override
   Future<void> screen({
     required String screenName,
     Map<String, Object>? properties,
@@ -232,6 +256,46 @@ class PosthogFlutterWeb extends PosthogFlutterPlatformInterface {
   @override
   Future<void> reloadFeatureFlags() async {
     return handleWebMethodCall(const MethodCall('reloadFeatureFlags'));
+  }
+
+  @override
+  Future<void> setPersonPropertiesForFlags(
+    Map<String, Object> userProperties,
+  ) async {
+    return handleWebMethodCall(
+      MethodCall('setPersonPropertiesForFlags', {
+        'userProperties': userProperties,
+      }),
+    );
+  }
+
+  @override
+  Future<void> resetPersonPropertiesForFlags() async {
+    return handleWebMethodCall(
+      const MethodCall('resetPersonPropertiesForFlags'),
+    );
+  }
+
+  @override
+  Future<void> setGroupPropertiesForFlags(
+    String groupType,
+    Map<String, Object> groupProperties,
+  ) async {
+    return handleWebMethodCall(
+      MethodCall('setGroupPropertiesForFlags', {
+        'groupType': groupType,
+        'groupProperties': groupProperties,
+      }),
+    );
+  }
+
+  @override
+  Future<void> resetGroupPropertiesForFlags({String? groupType}) async {
+    return handleWebMethodCall(
+      MethodCall('resetGroupPropertiesForFlags', {
+        if (groupType != null) 'groupType': groupType,
+      }),
+    );
   }
 
   @override
@@ -346,5 +410,21 @@ class PosthogFlutterWeb extends PosthogFlutterPlatformInterface {
       const MethodCall('isSessionReplayActive'),
     );
     return result as bool? ?? false;
+  }
+
+  @override
+  Future<void> addExceptionStep(
+    String message, {
+    Map<String, Object>? properties,
+  }) async {
+    final normalizedProperties =
+        properties != null ? PropertyNormalizer.normalize(properties) : null;
+
+    return handleWebMethodCall(
+      MethodCall('addExceptionStep', {
+        'message': message,
+        if (normalizedProperties != null) 'properties': normalizedProperties,
+      }),
+    );
   }
 }

@@ -23,7 +23,7 @@ jobs:
       has-changesets: ${{ steps.check.outputs.has-changesets }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: main
           fetch-depth: 0
@@ -67,7 +67,7 @@ jobs:
     steps:
       - name: Notify Slack - Approved
         continue-on-error: true
-        uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
+        uses: PostHog/.github/.github/actions/slack-thread-reply@cb0979b67dcd585828b61ac45927eef4da8f6287 # main
         with:
           slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
           slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}
@@ -83,7 +83,7 @@ jobs:
           private-key: ${{ secrets.GH_APP_POSTHOG_FLUTTER_RELEASER_PRIVATE_KEY }}
 
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: main
           fetch-depth: 0
@@ -123,7 +123,7 @@ jobs:
       - name: Commit version bump
         id: commit-version-bump
         if: steps.check-changes.outputs.committed == 'true'
-        uses: planetscale/ghcommit-action@25309d8005ac7c3bcd61d3fe19b69e0fe47dbdde # v0.2.20
+        uses: planetscale/ghcommit-action@a6b150b81dca5dd027baa898604418eec9e11465 # v0.2.22
         with:
           commit_message: "chore: release ${{ steps.apply-changesets.outputs.new-version }} [version bump]"
           repo: ${{ github.repository }}
@@ -146,7 +146,7 @@ jobs:
 
       - name: Cache Slack thread_ts for publish workflow
         if: steps.commit-version-bump.outputs.commit-hash != ''
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .slack-thread-ts
           key: slack-thread-ts-${{ steps.apply-changesets.outputs.new-version }}
@@ -160,10 +160,32 @@ jobs:
           git tag -a "$NEW_VERSION" -m "$NEW_VERSION"
           git push origin "$NEW_VERSION"
 
+      - name: Send failure event to PostHog
+        if: ${{ failure() }}
+        continue-on-error: true
+        uses: PostHog/posthog-github-action@9a6a19d360820ab4d95ecc4a5a7564062c895f84 # v1.3.0
+        with:
+          posthog-token: '${{ secrets.POSTHOG_PROJECT_API_KEY }}'
+          event: 'posthog-sdk-github-release-workflow-failure'
+          properties: >-
+            {
+              "commitSha": "${{ github.sha }}",
+              "jobStatus": "${{ job.status }}",
+              "ref": "${{ github.ref }}",
+              "repository": "${{ github.repository }}",
+              "sdk": "posthog-flutter",
+              "jobName": "version-bump",
+              "packageName": "posthog_flutter",
+              "packageVersion": "${{ steps.apply-changesets.outputs.new-version || 'unknown' }}",
+              "actionUrl": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "alertText": ":rotating_light: Failed to prepare release posthog_flutter@${{ steps.apply-changesets.outputs.new-version }} :rotating_light:",
+              "alertContext": "The version bump/changelog step failed before packages were published."
+            }
+
       - name: Notify Slack - Failed
         continue-on-error: true
         if: ${{ failure() && needs.notify-approval-needed.outputs.slack_ts != '' }}
-        uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
+        uses: PostHog/.github/.github/actions/slack-thread-reply@cb0979b67dcd585828b61ac45927eef4da8f6287 # main
         with:
           slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
           slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}
@@ -203,7 +225,7 @@ jobs:
       - name: Notify Slack - Rejected
         if: steps.check-rejection.outputs.was_rejected == 'true'
         continue-on-error: true
-        uses: PostHog/.github/.github/actions/slack-thread-reply@5fc4680761e8ac29a61b212756230eba0e276d8c
+        uses: PostHog/.github/.github/actions/slack-thread-reply@cb0979b67dcd585828b61ac45927eef4da8f6287 # main
         with:
           slack_bot_token: ${{ secrets.SLACK_CLIENT_LIBRARIES_BOT_TOKEN }}
           slack_channel_id: ${{ vars.SLACK_APPROVALS_CLIENT_LIBRARIES_CHANNEL_ID }}

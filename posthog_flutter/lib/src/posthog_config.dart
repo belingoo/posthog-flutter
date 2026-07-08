@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/widgets.dart';
 
+import 'logs/posthog_log_record.dart';
 import 'posthog_event.dart';
 import 'posthog_flutter_platform_interface.dart';
 
@@ -15,6 +16,19 @@ import 'posthog_flutter_platform_interface.dart';
 /// `FutureOr<PostHogEvent?>`).
 typedef BeforeSendCallback = FutureOr<PostHogEvent?> Function(
   PostHogEvent event,
+);
+
+/// Callback to intercept and modify log records before they are sent to
+/// PostHog.
+///
+/// The [record] argument contains the body, level, and user-provided
+/// attributes that are about to be captured. Return a possibly modified record
+/// to send it, or return `null` to drop it.
+///
+/// Callbacks can be synchronous or asynchronous (returning
+/// `FutureOr<PostHogLogRecord?>`).
+typedef BeforeSendLogCallback = FutureOr<PostHogLogRecord?> Function(
+  PostHogLogRecord record,
 );
 
 /// Controls whether events create or update PostHog person profiles.
@@ -187,6 +201,10 @@ class PostHogConfig {
   /// Configuration for error tracking and exception capture.
   final errorTrackingConfig = PostHogErrorTrackingConfig();
 
+  /// Configuration for the logs subsystem (`Posthog().captureLog()` and the
+  /// `Posthog().logger` facade).
+  final logsConfig = PostHogLogsConfig();
+
   /// Callback to be invoked when feature flags are loaded.
   ///
   /// Use [Posthog.getFeatureFlag] or [Posthog.isFeatureEnabled] within this
@@ -268,7 +286,7 @@ class PostHogConfig {
   ///   callbacks are not called.
   List<BeforeSendCallback> beforeSend = [];
 
-  // TODO: missing getAnonymousId, propertiesSanitizer, captureDeepLinks integrations
+  // TODO: missing getAnonymousId, captureDeepLinks integrations
 
   /// Creates a configuration for [projectToken].
   ///
@@ -314,8 +332,140 @@ class PostHogConfig {
       'dataMode': dataMode.name,
       'sessionReplayConfig': sessionReplayConfig.toMap(),
       'errorTrackingConfig': errorTrackingConfig.toMap(),
+      'logs': logsConfig.toMap(),
     };
   }
+}
+
+/// Configuration for the logs subsystem.
+///
+/// Assign values before calling `Posthog().setup(config)`. The identity and
+/// tuning fields are forwarded to the native iOS/Android logs configuration;
+/// [beforeSend] runs in Dart before a record is forwarded to the native SDK.
+///
+/// Every field that is `null` (or, for [resourceAttributes], empty) is left at
+/// the native SDK's default — it is not sent over the channel.
+///
+/// **Flutter web:** this configuration is **not** applied on web. The web SDK
+/// hooks onto an already-initialized posthog-js instance, so configure logs in
+/// your `posthog.init({...})` call instead. Only [beforeSend] runs on web (in
+/// Dart).
+class PostHogLogsConfig {
+  /// Creates a logs configuration with native defaults.
+  PostHogLogsConfig();
+
+  /// Sets the OTLP `service.name` resource attribute.
+  ///
+  /// When `null`, the native SDK's default is used (the app bundle id on Apple
+  /// platforms, the app namespace on Android).
+  String? serviceName;
+
+  /// Sets the OTLP `service.version` resource attribute.
+  ///
+  /// When `null`, the native SDK's default is used (the app version where the
+  /// platform provides one).
+  String? serviceVersion;
+
+  /// Sets the OTLP `deployment.environment` resource attribute (e.g.
+  /// `production`, `staging`). When `null`, the native SDK's default is used
+  /// (no environment).
+  String? environment;
+
+  /// Extra OTLP resource attributes merged into every payload.
+  ///
+  /// SDK-managed identity keys (`service.*`, `telemetry.sdk.*`) take precedence
+  /// and cannot be overridden.
+  Map<String, Object> resourceAttributes = {};
+
+  /// Periodic auto-flush interval. When `null`, the native default is used
+  /// (30s on iOS/Android).
+  Duration? flushInterval;
+
+  /// Queue depth that triggers an immediate flush. When `null`, the native
+  /// default is used (20 on iOS/Android).
+  int? flushAt;
+
+  /// Maximum number of records sent per POST. When `null`, the native default
+  /// is used (50 on iOS/Android).
+  int? maxBatchSize;
+
+  /// Maximum number of buffered records before the oldest are dropped (FIFO).
+  /// When `null`, the native default is used (1000 on iOS/Android).
+  int? maxBufferSize;
+
+  /// Maximum number of logs accepted per rate-cap window before excess logs are
+  /// dropped. When `null`, the native default is used (500 on iOS/Android). A
+  /// non-positive value disables the cap natively.
+  int? rateCapMaxLogs;
+
+  /// Length of the rate-cap window. When `null`, the native default is used
+  /// (10s on iOS/Android).
+  Duration? rateCapWindow;
+
+  /// Callbacks to intercept and modify log records before they are forwarded to
+  /// the native SDK.
+  ///
+  /// Callbacks are invoked in order for records captured via
+  /// `Posthog().captureLog()` and the `Posthog().logger` facade. Each callback
+  /// receives the record (possibly modified by previous callbacks). Return a
+  /// possibly modified record to continue, or return `null` to drop it.
+  /// Blanking the body also drops the record.
+  ///
+  /// **Example:**
+  /// ```dart
+  /// config.logsConfig.beforeSend = [
+  ///   (record) {
+  ///     record.attributes?.remove('password');
+  ///     return record;
+  ///   },
+  ///   (record) => record.body.contains('secret') ? null : record,
+  /// ];
+  /// ```
+  ///
+  /// **Note:**
+  /// - Runs in Dart on all platforms — it is intentionally not forwarded to the
+  ///   native SDKs' own `beforeSend`. Dart callbacks cannot cross the platform
+  ///   channel, and running it here gives identical behavior everywhere
+  ///   (including web). This mirrors the event [PostHogConfig.beforeSend].
+  /// - Callbacks can be synchronous or asynchronous (via
+  ///   `FutureOr<PostHogLogRecord?>`).
+  /// - A callback that throws is logged, and the record is dropped.
+  /// - The W3C trace fields (`traceId`, `spanId`, `traceFlags`) are **not**
+  ///   part of [PostHogLogRecord] and are not visible here. They pass straight
+  ///   through to the native SDK, so they cannot be redacted or used to drop a
+  ///   record. Keep anything sensitive out of those fields; put it in [body] or
+  ///   [PostHogLogRecord.attributes], which a callback can scrub or drop.
+  List<BeforeSendLogCallback> beforeSend = [];
+
+  /// Converts the identity and tuning options to a platform-channel map.
+  ///
+  /// Only fields the user set are included, so unset fields keep the native
+  /// default. [beforeSend] is intentionally omitted: it runs in Dart and never
+  /// crosses the platform channel.
+  Map<String, dynamic> toMap() {
+    return {
+      if (serviceName != null) 'serviceName': serviceName,
+      if (serviceVersion != null) 'serviceVersion': serviceVersion,
+      if (environment != null) 'environment': environment,
+      if (resourceAttributes.isNotEmpty)
+        'resourceAttributes': resourceAttributes,
+      if (flushInterval != null)
+        'flushIntervalSeconds': _wholeSeconds(flushInterval!),
+      if (flushAt != null) 'flushAt': flushAt,
+      if (maxBatchSize != null) 'maxBatchSize': maxBatchSize,
+      if (maxBufferSize != null) 'maxBufferSize': maxBufferSize,
+      if (rateCapMaxLogs != null) 'rateCapMaxLogs': rateCapMaxLogs,
+      if (rateCapWindow != null)
+        'rateCapWindowSeconds': _wholeSeconds(rateCapWindow!),
+    };
+  }
+
+  /// The native flush interval and rate-cap window are whole seconds. A
+  /// sub-second [Duration] truncates to `0`, which the native SDK treats as
+  /// "disabled" (rate cap) or continuous flushing — surprising for a caller who
+  /// set, say, 500ms. Floor at 1s, the smallest value the native API can honor.
+  static int _wholeSeconds(Duration duration) =>
+      duration.inSeconds < 1 ? 1 : duration.inSeconds;
 }
 
 /// Configuration for mobile session replay capture and masking.
@@ -358,6 +508,15 @@ class PostHogSessionReplayConfig {
   /// If null, sampling is controlled by remote config (when available).
   double? sampleRate;
 
+  /// Mask all platform views (WebView, Maps, etc.) in session replay.
+  ///
+  /// Default: true.
+  ///
+  /// When true, every platform view is covered with a black rectangle in
+  /// session replay screenshots. Set to false to opt out globally, or wrap
+  /// individual views with [PostHogPlatformView] for per-view control.
+  var maskAllPlatformViews = true;
+
   /// Converts this session replay configuration to a platform-channel map.
   ///
   /// Returns values consumed by the Android and Apple session replay
@@ -367,6 +526,7 @@ class PostHogSessionReplayConfig {
       'maskAllImages': maskAllImages,
       'maskAllTexts': maskAllTexts,
       'throttleDelayMs': throttleDelay.inMilliseconds,
+      'maskAllPlatformViews': maskAllPlatformViews,
       if (sampleRate != null) 'sampleRate': sampleRate,
     };
   }
@@ -510,6 +670,12 @@ class PostHogErrorTrackingConfig {
   /// Default: false
   var captureIsolateErrors = false;
 
+  /// Configuration for exception steps (breadcrumb-style context records
+  /// attached to every captured `$exception` as `$exception_steps`).
+  ///
+  /// Record steps with `Posthog().addExceptionStep()`.
+  final exceptionSteps = PostHogExceptionStepsConfig();
+
   /// Converts this error tracking configuration to a platform-channel map.
   ///
   /// Returns values consumed by the Android, Apple, and Dart exception capture
@@ -524,6 +690,48 @@ class PostHogErrorTrackingConfig {
       'capturePlatformDispatcherErrors': capturePlatformDispatcherErrors,
       'captureNativeExceptions': captureNativeExceptions,
       'captureIsolateErrors': captureIsolateErrors,
+      'exceptionSteps': exceptionSteps.toMap(),
+    };
+  }
+}
+
+/// Configuration for exception steps.
+///
+/// Exception steps are breadcrumb-style context records recorded over time via
+/// `Posthog().addExceptionStep()`. The SDK keeps a rolling, byte-bounded buffer
+/// of these steps and attaches a snapshot to every captured `$exception` event
+/// as `$exception_steps`, giving the error tracking UI a timeline of recent
+/// activity leading up to each error.
+///
+/// The buffer is owned by the embedded native SDK (iOS/Android), so steps also
+/// survive native fatal crashes and attach to the crash `$exception` reported
+/// on the next launch.
+///
+/// **Flutter web:** the buffer lives in posthog-js. Steps are forwarded to it,
+/// but they only attach to exceptions captured by posthog-js itself, not to
+/// exceptions captured via `Posthog().captureException()` on web.
+class PostHogExceptionStepsConfig {
+  /// Creates an exception-steps configuration with native defaults.
+  PostHogExceptionStepsConfig();
+
+  /// Whether recording and attaching exception steps is enabled.
+  ///
+  /// When disabled, `Posthog().addExceptionStep()` is a no-op and nothing is
+  /// attached. Defaults to `true`.
+  var enabled = true;
+
+  /// Total UTF-8 byte budget for the rolling step buffer.
+  ///
+  /// When adding a step would exceed the budget, the oldest steps are evicted
+  /// until the total fits. A single step larger than the budget is rejected
+  /// outright. Defaults to `32768` (32 KiB).
+  var maxBytes = 32768;
+
+  /// Converts this configuration to a platform-channel map.
+  Map<String, Object> toMap() {
+    return {
+      'enabled': enabled,
+      'maxBytes': maxBytes,
     };
   }
 }
